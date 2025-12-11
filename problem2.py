@@ -37,7 +37,6 @@ from pyspark.sql import functions as F
 from pyspark.sql.functions import (
     input_file_name,
     regexp_extract,
-    to_timestamp,
     col,
 )
 
@@ -145,31 +144,33 @@ def extract_application_timeline(df):
         cluster_id, application_id, app_number, start_time, end_time
     '''
 
-    # extract application id from file pat
-    df = df.withColumn(
-        "application_id",
-        regexp_extract(col("file_path"), r"(application_\d+_\d+)", 1),
+    # filepath and application/cluster ids
+    df = (
+        df.withColumn("file_path", input_file_name())
+          .withColumn(
+              "application_id",
+              regexp_extract(col("file_path"), r"(application_\d+_\d+)", 1),
+          )
+          .withColumn(
+              "cluster_id",
+              regexp_extract(col("application_id"), r"application_(\d+)_", 1),
+          )
     )
 
-    # extract cluster id and app number from app id
-    df = df.withColumn(
-        "cluster_id",
-        regexp_extract(col("application_id"), r"application_(\d+)_\d+", 1),
-    ).withColumn(
-        "app_number",
-        regexp_extract(col("application_id"), r"application_\d+_(\d+)", 1),
-    )
-
-    # extract timestamp string from log line
+    # extract timestamp substring from logline
     df = df.withColumn(
         "timestamp_str",
-        regexp_extract(col("value"), r"^(\d{2}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})", 1),
+        regexp_extract(col("value"), r"(\d{2}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})", 1),
     )
 
-    # convert to timestamp
+    # timestamp parsing
     df = df.withColumn(
         "timestamp",
-        to_timestamp(col("timestamp_str"), "yy/MM/dd HH:mm:ss"),
+        F.coalesce(
+            F.expr("try_to_timestamp(timestamp_str, 'yy/MM/dd HH:mm:ss')"),
+            F.expr("try_to_timestamp(timestamp_str, 'yyyy-MM-dd HH:mm:ss')"),
+            F.expr("try_to_timestamp(timestamp_str, 'MM/dd/yyyy HH:mm:ss')")
+        ),
     )
 
     # filter out rows missing fields
@@ -178,16 +179,26 @@ def extract_application_timeline(df):
         (col("cluster_id") != "") &
         (col("timestamp").isNotNull())
     )
-    logger.info("filtered to %d rows with application_id, cluster_id, and timestamp", df.count())
 
-    # agg per (cluster_id, application_id, app_number)
-    apps = (
-        df.groupBy("cluster_id", "application_id", "app_number")
-        .agg(
-            F.min("timestamp").alias("start_time"),
-            F.max("timestamp").alias("end_time"),
-        )
+    logger.info(
+        "filtered to %d rows with application_id, cluster_id, and timestamp",
+        df.count(),
     )
+
+    # agg start/end times (cluster_id, application_id)
+    apps = (
+        df.groupBy("cluster_id", "application_id")
+          .agg(
+              F.min("timestamp").alias("start_time"),
+              F.max("timestamp").alias("end_time"),
+          )
+          .withColumn(
+              "app_number",
+              F.lpad(F.split("application_id", "_").getItem(2), 4, "0"),
+          )
+          .orderBy("cluster_id", "app_number")
+    )
+
     logger.info("extracted %d application timelines", apps.count())
     return apps
 
@@ -309,53 +320,54 @@ def generate_density_plot(timeline_pd: pd.DataFrame, cluster_summary_pd: pd.Data
     histogram + kde, log scale on x axis
     problem2_density_plot.png
     '''
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    timeline_pd["cluster_id"] = timeline_pd["cluster_id"].astype(str)
+    cluster_summary_pd["cluster_id"] = cluster_summary_pd["cluster_id"].astype(str)
 
-    # get largest cluster by num_applications
-    cluster_summary_pd = cluster_summary_pd.sort_values(
-        "num_applications", ascending=False
-    )
-    largest_cluster_id = str(cluster_summary_pd.iloc[0]["cluster_id"])
+    timeline_pd["start_time"] = pd.to_datetime(timeline_pd["start_time"], errors="coerce")
+    timeline_pd["end_time"] = pd.to_datetime(timeline_pd["end_time"], errors="coerce")
 
-    # filter timeline for cluster
-    df_cluster = timeline_pd[timeline_pd["cluster_id"] == largest_cluster_id].copy()
-
-    # convert to datetime, compute duration in secs
-    df_cluster["start_time"] = pd.to_datetime(df_cluster["start_time"])
-    df_cluster["end_time"] = pd.to_datetime(df_cluster["end_time"])
-    df_cluster["duration_seconds"] = (
-        df_cluster["end_time"] - df_cluster["start_time"]
+    # duration in secs
+    timeline_pd["duration_sec"] = (
+        timeline_pd["end_time"] - timeline_pd["start_time"]
     ).dt.total_seconds()
 
-    # filter out non pos or missing durations
-    df_cluster = df_cluster[df_cluster["duration_seconds"] > 0]
+    # largest cluster
+    top_cluster = (
+        cluster_summary_pd.sort_values("num_applications", ascending=False)
+        .iloc[0]["cluster_id"]
+    )
 
-    n = df_cluster.shape[0]
-    if n == 0:
+    # filter for cluster
+    cluster_df = timeline_pd[timeline_pd["cluster_id"] == top_cluster].copy()
+
+    # keep pos durations
+    cluster_df = cluster_df[
+        cluster_df["duration_sec"].notna() & (cluster_df["duration_sec"] > 0)
+    ]
+
+    # ff empty, warn and exit
+    if cluster_df.empty:
         logger.warning(
-            "no valid durations for largest cluster %s; skipping density plot",
-            largest_cluster_id,
+            f"No valid durations for largest cluster {top_cluster}; skipping density plot."
         )
         return
 
-    sns.set_theme(style="whitegrid")
-    plt.figure(figsize=(10, 6))
+    n = len(cluster_df)
 
-    sns.histplot(
-        df_cluster["duration_seconds"],
-        bins=30,
-        kde=True,
-    )
-
+    # plot
+    plt.figure(figsize=(8, 5))
+    sns.histplot(cluster_df["duration_sec"], bins=30, kde=True, color="royalblue")
     plt.xscale("log")
     plt.xlabel("Job Duration (seconds, log scale)")
-    plt.ylabel("Count")
-    plt.title(f"Job Duration Distribution for Cluster {largest_cluster_id} (n={n})")
-
+    plt.ylabel("Frequency")
+    plt.title(f"Duration Distribution – Cluster {top_cluster} (n={n})")
     plt.tight_layout()
-    plt.savefig(DENSITY_PLOT_PATH)
+
+    out_path = "/home/ubuntu/data/output/problem2_density_plot.png"
+    plt.savefig(out_path)
     plt.close()
-    logger.info("saved density plot to %s", DENSITY_PLOT_PATH)
+
+    logger.info(f"saved density plot to {out_path}")
 
 # main
 def main() -> int:
@@ -402,7 +414,7 @@ def main() -> int:
 
         logger.info("extracting application timelines")
         apps_df = extract_application_timeline(raw_df)
-        
+
         logger.info("writing timeline csv")
         write_timeline_csv(apps_df)
 
